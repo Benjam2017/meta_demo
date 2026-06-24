@@ -399,6 +399,100 @@ Content-Type: application/json
 
 配置完之后，**任何时候**有用户发消息、或者你发出去的消息状态变化（送达/已读/失败），Meta 都会主动 `POST` 到这个 URL，内容就是 PRD 6.2 节展示的那种 JSON。
 
+#### A.4.1 验证握手的完整细节（`GET /webhook`）
+
+这是配置阶段唯一一次的 `GET` 请求，三个 query 参数缺一不可：
+
+```
+GET /webhook?hub.mode=subscribe&hub.verify_token=my_secret_token&hub.challenge=1158201444
+```
+
+| 参数 | 含义 |
+|---|---|
+| `hub.mode` | 固定值 `"subscribe"`，标识这是一次订阅校验 |
+| `hub.verify_token` | 你在 Meta 后台填的那个字符串，原路返回让你比对 |
+| `hub.challenge` | 一个随机数字，你必须**原样**、以**纯文本**（不是 JSON）返回，HTTP 状态码 200 |
+
+对应代码：
+
+```js
+// app.js:32-42
+app.get("/webhook", function (req, res) {
+  if (
+    req.query["hub.mode"] != "subscribe" ||
+    req.query["hub.verify_token"] != config.verifyToken
+  ) {
+    res.sendStatus(403);   // token 不对，直接拒绝
+    return;
+  }
+  res.send(req.query["hub.challenge"]);  // 校验通过，原样回显
+});
+```
+
+**常见踩坑**：如果这里返回了 JSON（比如 `res.json({challenge: ...})`）而不是纯文本，Meta 后台会显示"验证失败"，因为它要的是裸字符串，不是包了一层的对象。
+
+#### A.4.2 真实事件的请求长什么样（HTTP 层面）
+
+不只是 body，连 headers 也要注意：
+
+```
+POST /webhook HTTP/1.1
+Host: yourdomain.com
+Content-Type: application/json
+X-Hub-Signature-256: sha256=7f3c1e2a...（64位十六进制）
+User-Agent: facebookexternalhit/1.1
+
+{ "object": "whatsapp_business_account", "entry": [ ... ] }
+```
+
+- `X-Hub-Signature-256` 是**唯一**用来证明来源的凭证——没有 IP 白名单机制，Meta 的出口 IP 段会变化，所以**永远不要**用"判断来源 IP"代替签名校验。
+- Content-Type 总是 `application/json`，所以 `app.js:29` 用 `json({ verify: ... })` 而不是 `urlencoded` 来处理这条路径上的 body（`urlencoded` 中间件第 22-26 行是给别的场景留的，webhook 走的是 json 中间件）。
+
+#### A.4.3 签名校验到底在比对什么（逐步拆解）
+
+```js
+// app.js:90-106
+function verifyRequestSignature(req, res, buf) {
+  let signature = req.headers["x-hub-signature-256"];      // 1. 取出 header，形如 "sha256=7f3c1e2a..."
+  let elements = signature.split("=");
+  let signatureHash = elements[1];                          // 2. 拿到等号后面真正的哈希值
+  let expectedHash = crypto
+    .createHmac("sha256", config.appSecret)                 // 3. 用你的 APP_SECRET 做密钥
+    .update(buf)                                            // 4. 对"原始请求体字节"（不是解析后的 JS 对象！）做 HMAC
+    .digest("hex");
+  if (signatureHash != expectedHash) {
+    throw new Error("Couldn't validate the request signature.");  // 5. 不一致就拒绝整个请求
+  }
+}
+```
+
+**为什么必须用原始字节、不能用 `JSON.stringify(req.body)` 重新算**：JSON 序列化在不同语言/库之间可能有空格、字段顺序的细微差异，只要差一个字节，HMAC 就完全不同。这就是为什么这个 `verify` 回调要挂在 `body-parser` **解析之前**的钩子上（`app.js:29` 的 `json({ verify: verifyRequestSignature })`），第三个参数 `buf` 就是还没被解析、原封不动的 `Buffer`。
+
+#### A.4.4 webhook 字段（field）不止 `messages` 一种
+
+Meta 后台订阅页面会列出一串可勾选的字段，本 demo 只勾了 `messages`，但平台还提供（仅列常见的，本 demo 均未使用）：
+
+| Field | 触发时机 |
+|---|---|
+| `messages` | **本 demo 使用**——用户发消息、以及你发出消息后的状态变化（delivered/read/sent/failed），都从这个字段推过来 |
+| `message_template_status_update` | 你提交的模板审核结果变化（PENDING → APPROVED/REJECTED） |
+| `message_template_quality_update` | 已上线模板的"质量评分"被 Meta 重新评估 |
+| `phone_number_quality_update` | 你的号码被 Meta 标记了限速/质量等级变化（消息发太多被用户举报会触发） |
+| `account_update` | WABA 账号本身的状态变化（如被封禁） |
+
+**容易误解的点**：字段名是 `messages`，但它的 payload 里其实同时可能出现 `value.messages`（用户发的消息）**或** `value.statuses`（状态回调）——这两者是同一个订阅字段下的两种不同事件形状，`app.js:55` 和 `app.js:62` 分别用 `if (value.statuses)` / `if (value.messages)` 来区分，而不是看 `field` 的值。
+
+#### A.4.5 Meta 的重试与超时行为
+
+- 你的服务器必须在**几秒内**返回 HTTP 200，否则 Meta 视为投递失败。
+- 失败后 Meta 会**按退避策略重试**（间隔逐渐变长），重试一段时间后放弃（具体窗口由 Meta 控制，不是你能配置的）。
+- 这意味着**同一个事件可能被投递多次**（网络抖动、你这边短暂超时都可能导致重复）——本 demo 目前**没有做任何去重**：`handleMessage`/`handleStatus` 如果被同一个事件触发两次，会真的发送两次回复。这是当前实现的一个已知缺口，可以补在 PRD 第 8 节"已知限制"里。
+- 正因为重试机制存在，`app.js:73` 选择"先回 200，业务逻辑异步处理"而不是"处理完再回 200"——避免业务逻辑（调用 Graph API）的延迟拖慢到让 Meta 误判超时、触发不必要的重试。
+
+#### A.4.6 不保证顺序
+
+如果用户连续快速发了三条消息，理论上你的 `/webhook` 可能不是严格按发送顺序收到这三个 `POST`（网络路径、Meta 内部队列都可能导致乱序）。本 demo 因为每次只依据**单条消息自身的按钮 ID**路由、不依赖"上一条消息是什么"的上下文，天然不受这个问题影响——这也是为什么 CLAUDE.md 里强调"每条消息无状态路由"是有意为之的设计，不只是偷懒。
+
 ### A.5 消息到底分几类，怎么决定能不能发
 
 这是最容易踩坑的一点。WhatsApp 不允许商家随意给用户发广告骚扰消息，所以有一套"窗口"规则：
